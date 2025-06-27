@@ -1,19 +1,12 @@
 #%%
 from dotenv import load_dotenv
 import os
-from agents import Agent, OpenAIChatCompletionsModel, Runner, RunContextWrapper, handoff,set_tracing_disabled
+from agents import Runner, set_tracing_disabled
 from openai import AsyncOpenAI
 from databricks.sdk import WorkspaceClient
 import asyncio
-from dataclasses import dataclass
-from typing import Optional, Dict
-from toolkit import (
-    get_store_performance_info,
-    get_product_inventory_info,
-    get_business_conduct_policy_info,
-    get_state_census_data,
-    do_research_and_reason,
-)
+from src.agents.shared_context import SharedAgentContext
+from src.agents.agent_factory import create_agent_system
 from rich.console import Console
 from rich.panel import Panel
 from rich.spinner import Spinner
@@ -25,10 +18,10 @@ import argparse
 # Initialize Rich console
 console = Console()
 
-load_dotenv("/Users/sathish.gangichetty/Documents/openai-agents/apps/.env-local")
+load_dotenv(".env")
 
 MODEL_NAME = os.getenv("DATABRICKS_MODEL") or ""
-# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "dummy_key_for_databricks_usage"
 BASE_URL = os.getenv("DATABRICKS_BASE_URL") or ""
 API_KEY = os.getenv("DATABRICKS_TOKEN") or ""
 set_tracing_disabled(True)
@@ -38,70 +31,11 @@ w = WorkspaceClient(
     host=os.getenv("DATABRICKS_HOST"), token=os.getenv("DATABRICKS_TOKEN")
 )
 
-# Define a shared context class to pass data between agents
-@dataclass
-class SharedAgentContext:
-    store_location: Optional[str] = None
-    store_id: Optional[str] = None
-    demographic_data: Optional[Dict] = None
-    state_code: Optional[str] = None
-    current_agent: Optional[str] = None
-    current_tool: Optional[str] = None
-    # Add message history tracking
-    conversation_history: list = None
-    
-    def __post_init__(self):
-        if self.conversation_history is None:
-            self.conversation_history = []
-            
-    def add_message(self, role: str, content: str):
-        """Add a message to the conversation history"""
-        self.conversation_history.append({"role": role, "content": content})
-        
-    def get_formatted_history(self):
-        """Format conversation history for consumption by VisionCraft MCP"""
-        if not self.conversation_history:
-            return "No conversation history available."
-        
-        formatted_history = []
-        for msg in self.conversation_history:
-            formatted_history.append(f"{msg['role']}: {msg['content']}")
-        
-        return "\n\n".join(formatted_history)
+# Create agent system
+agent_system = create_agent_system(client, MODEL_NAME)
+triage_agent = agent_system['triage_agent']
 
 #%%
-# Helper function to load prompts from files
-def load_prompt(file_path):
-    with open(file_path, 'r') as file:
-        return file.read()
-
-# Load agent prompts
-enterprise_intelligence_prompt = load_prompt('prompts/enterprise_intelligence_agent.txt')
-market_intelligence_prompt = load_prompt('prompts/market_intelligence_agent.txt')
-triage_agent_prompt = load_prompt('prompts/triage_agent.txt')
-
-# Enhance the agent prompts to handle the tools-for-agents pattern
-enhanced_enterprise_prompt = enterprise_intelligence_prompt + """
-
-## Additional Capabilities
-You now have the Market Intelligence Agent available as a tool. When a query requires demographic or market research data:
-1. First determine the relevant location information using your store performance tools
-2. Then use the get_market_intelligence tool to obtain demographic information for that location
-3. Combine both sources of information to provide a complete response
-"""
-
-enhanced_market_prompt = market_intelligence_prompt + """
-
-## Additional Capabilities
-You now have the Enterprise Intelligence Agent available as a tool. When a query requires store-specific information:
-1. Use the get_enterprise_data tool to first obtain store location or performance information
-2. Then use your demographic and market research tools to analyze that location
-3. Combine both sources of information to provide a complete response
-
-For example, if asked "Based on where store 110 is located, what are the demographics of the area?":
-1. First use get_enterprise_data to find out where store 110 is located
-2. Then analyze the demographics of that location using your tools
-"""
 
 # Create lifecycle hooks to track agent execution
 class AgentExecutionHooks:
@@ -109,7 +43,7 @@ class AgentExecutionHooks:
         self.console = console
         self.start_time = None
         
-    async def on_agent_start(self, context: RunContextWrapper[SharedAgentContext], agent):
+    async def on_agent_start(self, context, agent):
         self.start_time = time.time()
         agent_name = agent.name
         context.context.current_agent = agent_name
@@ -117,7 +51,7 @@ class AgentExecutionHooks:
         history_count = len(context.context.conversation_history) if context.context.conversation_history else 0
         self.console.print(f"[bold blue]🚀 Starting {agent_name} with {history_count} history entries")
     
-    async def on_agent_end(self, context: RunContextWrapper[SharedAgentContext], agent, output):
+    async def on_agent_end(self, context, agent, output):
         agent_name = agent.name
         duration = time.time() - self.start_time
         self.console.print(Panel(f"[bold green]✅ {agent_name} completed in {duration:.2f}s", expand=False))
@@ -127,12 +61,12 @@ class AgentExecutionHooks:
         history_count = len(context.context.conversation_history)
         self.console.print(f"[dim]Conversation history now has {history_count} entries[/dim]")
         
-    async def on_tool_start(self, context: RunContextWrapper[SharedAgentContext], agent, tool):
+    async def on_tool_start(self, context, agent, tool):
         tool_name = tool.name
         context.context.current_tool = tool_name
         self.console.print(f"[yellow]🔧 Using tool: {tool_name}")
         
-    async def on_tool_end(self, context: RunContextWrapper[SharedAgentContext], agent, tool, result):
+    async def on_tool_end(self, context, agent, tool, result):
         tool_name = tool.name
         self.console.print(f"[green]✓ Tool {tool_name} completed")
         # Record tool usage in conversation history
@@ -141,7 +75,7 @@ class AgentExecutionHooks:
         history_count = len(context.context.conversation_history)
         self.console.print(f"[dim]Conversation history now has {history_count} entries[/dim]")
     
-    async def on_handoff(self, context: RunContextWrapper[SharedAgentContext], from_agent, to_agent):
+    async def on_handoff(self, context, from_agent, to_agent):
         from_name = from_agent.name
         to_name = to_agent.name
         self.console.print(Panel(f"[bold magenta]↪️ Handoff: {from_name} → {to_name}", expand=False))
@@ -151,106 +85,6 @@ class AgentExecutionHooks:
         history_count = len(context.context.conversation_history)
         self.console.print(f"[dim]Conversation history now has {history_count} entries[/dim]")
 
-# First create placeholder agents, then enhance them with tools
-
-# Initial Enterprise Intelligence Agent 
-enterprise_intelligence_agent = Agent(
-    name="Enterprise Intelligence Agent",
-    handoff_description="Specialist in enterprise analytics pertaining to the store performance, sales, store location, returns, BOPIS(buy online pick up in store), policy, inventory etc.",
-    instructions=enterprise_intelligence_prompt,
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
-    tools=[
-        get_business_conduct_policy_info,
-        get_store_performance_info,
-        get_product_inventory_info,
-    ],
-)
-
-# Initial Market Intelligence Agent
-market_intelligence_agent = Agent(
-    name="Market Intelligence Agent",
-    handoff_description="Specialist in market research pertaining to general questions about the market, industry, news, competitors, demographics, etc.",
-    instructions=market_intelligence_prompt,
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
-    tools=[
-        get_state_census_data, 
-        do_research_and_reason,
-    ],
-)
-
-# Now enhance each agent with the other as a tool
-enhanced_enterprise_agent = Agent(
-    name="Enterprise Intelligence Agent",
-    handoff_description="Specialist in enterprise analytics pertaining to the store performance, sales, store location, returns, BOPIS(buy online pick up in store), policy, inventory etc.",
-    instructions=enhanced_enterprise_prompt,
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
-    tools=[
-        get_business_conduct_policy_info,
-        get_store_performance_info,
-        get_product_inventory_info,
-        market_intelligence_agent.as_tool(
-            tool_name="get_market_intelligence",
-            tool_description="Get demographic and market research information for a specific location or area",
-        ),
-    ],
-)
-
-enhanced_market_agent = Agent(
-    name="Market Intelligence Agent",
-    handoff_description="Specialist in market research pertaining to general questions about the market, industry, news, competitors, demographics, etc.",
-    instructions=enhanced_market_prompt,
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
-    tools=[
-        get_state_census_data, 
-        do_research_and_reason,
-        enterprise_intelligence_agent.as_tool(
-            tool_name="get_enterprise_data",
-            tool_description="Get store location, performance data, or inventory information for specific store numbers",
-        ),
-    ],
-)
-
-def on_enterprise_intelligence_handoff(ctx: RunContextWrapper[SharedAgentContext]):
-    rprint("[bold cyan]🔄 Handing off to enterprise intelligence agent")
-
-def on_market_intelligence_handoff(ctx: RunContextWrapper[SharedAgentContext]):
-    rprint("[bold cyan]🔄 Handing off to market intelligence agent")
-
-# Update triage agent with improved instructions
-enhanced_triage_prompt = triage_agent_prompt + """
-
-## Updated Decision Logic for Compound Questions
-For compound questions that require information from multiple agents:
-1. Identify the primary intent/goal of the query (what information does the user ultimately want?)
-2. Route to the agent that is best suited to deliver the primary information
-3. The specialist agent will use other agents as tools when needed
-
-Examples of compound questions:
-- "Based on where store 110 is located, what are the demographics of the area?"
-   → Route to Market Intelligence Agent (primary goal is demographics information)
-   → The Market Intelligence Agent will use the Enterprise Intelligence Agent tool to get store 110's location
-
-## Conversation Summarization 
-When the user asks for a summary of the conversation (e.g., "summarize our conversation", "what have we discussed?", etc.):
-1. Access the conversation_history from the shared context
-2. Generate a concise, structured summary of the key points
-3. Focus on key questions, insights, and decision points from the conversation
-4. Highlight any important information discovered during the conversation
-5. Do NOT hand off to other agents for summarization requests
-"""
-
-#%%
-triage_agent = Agent(
-    name="Triage Agent",
-    instructions=enhanced_triage_prompt,
-    model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
-    handoffs=[
-        handoff(
-            enhanced_enterprise_agent, on_handoff=on_enterprise_intelligence_handoff
-        ),
-        handoff(enhanced_market_agent, on_handoff=on_market_intelligence_handoff),
-    ],
-)
 
 #%%
 async def process_query(query, shared_context=None):
