@@ -19,15 +19,15 @@ load_dotenv(".env")
 
 # Initialize environment variables
 MODEL_NAME = os.getenv("DATABRICKS_MODEL") or ""
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "dummy_key_for_databricks_usage"
 BASE_URL = os.getenv("DATABRICKS_BASE_URL") or ""
 API_KEY = os.getenv("DATABRICKS_TOKEN") or ""
 # API_KEY = st.context.headers.get('X-Forwarded-Access-Token')
-
 MLFLOW_EXPERIMENT_ID = os.getenv("MLFLOW_EXPERIMENT_ID") or ""
 set_tracing_disabled(False)
 try:
     if MLFLOW_EXPERIMENT_ID:
+        # Set both tracking and registry URIs to prevent local mlruns folder creation
+        mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks-uc")
         mlflow.tracing.set_destination(Databricks(experiment_id=MLFLOW_EXPERIMENT_ID))
         mlflow.openai.autolog()
