@@ -31,12 +31,12 @@ def create_enterprise_agent(client: AsyncOpenAI, model_name: str, market_agent=N
     if market_agent:
         enhanced_prompt = enterprise_intelligence_prompt + """
 
-## Additional Capabilities
-You now have the Market Intelligence Agent available as a tool. When a query requires demographic or market research data:
-1. First determine the relevant location information using your store performance tools
-2. Then use the get_market_intelligence tool to obtain demographic information for that location
-3. Combine both sources of information to provide a complete response
-"""
+        ## Additional Capabilities
+        You now have the Market Intelligence Agent available as a tool. When a query requires demographic or market research data:
+        1. First determine the relevant location information using your store performance tools
+        2. Then use the get_market_intelligence tool to obtain demographic information for that location
+        3. Combine both sources of information to provide a complete response
+        """
         
         enhanced_agent = Agent(
             name="Enterprise Intelligence Agent",
